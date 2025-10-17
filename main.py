@@ -241,6 +241,17 @@ def run():
     else:
         print("Skipping 2026 team statistics export due to missing table.")
 
+    # 3) NHL 2026 advanced team statistics table
+    url_league_2026_adv = "https://www.hockey-reference.com/leagues/NHL_2026.html#stats_adv"
+    table_id_team_stats_adv = "stats_adv"  # Hockey-Reference id for 'Advanced Team Statistics'
+    team_stats_adv_df = fetch_table_by_id(url_league_2026_adv, table_id_team_stats_adv)
+    if team_stats_adv_df is not None:
+        team_stats_adv_df = basic_clean(team_stats_adv_df)
+        out3 = save_to_csv(team_stats_adv_df, "NHL_2026_team_statistics_advanced")
+        print(f"Saved 2026 advanced team statistics to: {out3}")
+    else:
+        print("Skipping 2026 advanced team statistics export due to missing table.")
+
 
 if __name__ == "__main__":
     try:
