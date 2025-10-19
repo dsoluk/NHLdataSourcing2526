@@ -3,6 +3,7 @@ import sys
 from datetime import datetime
 from typing import Optional
 import re
+import json
 
 import pandas as pd
 import requests
@@ -218,6 +219,157 @@ def save_to_csv(df: pd.DataFrame, base_filename: str, downloads_dir: Optional[st
     return path
 
 
+def _normalize_player_name(name: str) -> str:
+    if name is None:
+        return ""
+    return str(name).strip().lower()
+
+
+def load_player_registry(json_path: str) -> dict:
+    """Load a player registry from a local JSON file and build a mapping of name->master_id.
+
+    Supports several common JSON shapes, including nested structures:
+    - {"players": [ {"name": "...", "master_id": 123}, ... ]}
+    - [ {"name": "...", "master_id": 123}, ... ]
+    - [ {"teamAbbrev": "...", "players": [ {"name": "...", "master_id": 123}, ... ]}, ... ]
+    - { "Some Player": {"master_id": 123}, ... }
+    - { "Some Player": 123, ... }
+    Recognizes name keys: name, player_name, player, full_name
+    Recognizes id keys: master_id, masterId, id
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    mapping = {}
+
+    def add_pair(nm, mid):
+        if nm is None or mid is None:
+            return
+        try:
+            mid_int = int(mid)
+        except Exception:
+            # ignore non-integer ids
+            return
+        mapping[_normalize_player_name(nm)] = mid_int
+
+    def extract_from_obj(obj):
+        if not isinstance(obj, dict):
+            return False
+        # Try to find name/id keys in a dict object
+        name_keys = ["name", "player_name", "player", "full_name"]
+        id_keys = ["master_id", "masterId", "id"]
+        nm = None
+        mid = None
+        for k in name_keys:
+            if k in obj and obj[k] not in (None, ""):
+                nm = obj[k]
+                break
+        for k in id_keys:
+            if k in obj and obj[k] not in (None, ""):
+                mid = obj[k]
+                break
+        if nm is not None and mid is not None:
+            add_pair(nm, mid)
+            return True
+        return False
+
+    def walk(node):
+        # Recursively traverse lists and dicts to find player dicts or nested 'players' arrays
+        if isinstance(node, list):
+            for it in node:
+                walk(it)
+        elif isinstance(node, dict):
+            # If this dict itself is a player entry, try to extract
+            found = extract_from_obj(node)
+            # If it has a 'players' list, traverse it
+            if "players" in node and isinstance(node.get("players"), list):
+                walk(node["players"])
+            # Also traverse all values to catch deeper nests
+            for v in node.values():
+                if isinstance(v, (list, dict)):
+                    walk(v)
+
+    # Start recursive walk from the root
+    walk(data)
+
+    return mapping
+
+
+def map_master_ids_to_skaters(df: pd.DataFrame, registry_path: str, name_column: Optional[str] = None) -> pd.DataFrame:
+    """Add a 'master_id' column by matching player names using the local registry.
+    If no match is found, set 0 and print a console message listing unmatched names.
+    """
+    if df is None or df.empty:
+        return df
+
+    # Determine name column
+    candidate_cols = [name_column] if name_column else []
+    candidate_cols += ["Player", "Name", "player", "PLAYER"]
+    name_col = next((c for c in candidate_cols if c and c in df.columns), None)
+
+    # Heuristic fallbacks if not found by exact name
+    if not name_col:
+        # any column whose name contains 'player'
+        contains_player = [c for c in df.columns if isinstance(c, str) and "player" in c.lower()]
+        if contains_player:
+            name_col = contains_player[0]
+    if not name_col:
+        # choose first likely name-like text column
+        def is_name_like(series: pd.Series) -> bool:
+            if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+                return False
+            s = series.astype(str).dropna()
+            if s.empty:
+                return False
+            sample = s.head(200)
+            has_letters = sample.str.contains(r"[A-Za-z]", regex=True, na=False)
+            has_spaces = sample.str.contains(r"\s", regex=True, na=False)
+            is_not_numeric = ~sample.str.fullmatch(r"[-+]?\d+(\.\d+)?", na=False)
+            score = (has_letters & is_not_numeric).mean() + (has_spaces & is_not_numeric).mean()
+            return score / 2 >= 0.6
+        for c in df.columns:
+            try:
+                if is_name_like(df[c]):
+                    name_col = c
+                    break
+            except Exception:
+                continue
+    if not name_col:
+        # cannot map without a name column
+        print("Player name column not found in skaters dataframe; skipping master_id mapping. Available columns: " + ", ".join(map(str, df.columns)))
+        df["master_id"] = 0
+        return df
+
+    print(f"Using '{name_col}' column for player name mapping.")
+
+    # Load registry
+    try:
+        mapping = load_player_registry(registry_path)
+    except FileNotFoundError:
+        print(f"Player registry not found at: {registry_path}. Setting master_id=0 for all.")
+        df["master_id"] = 0
+        return df
+    except Exception as e:
+        print(f"Failed to load player registry from {registry_path}: {e}. Setting master_id=0 for all.")
+        df["master_id"] = 0
+        return df
+
+    # Build normalized series and apply mapping
+    norm_names = df[name_col].astype(str).map(_normalize_player_name)
+    mapped = norm_names.map(mapping)
+
+    # Fill missing with 0 and ensure integer
+    master_id_series = pd.to_numeric(mapped, errors="coerce").fillna(0).astype(int)
+    df["master_id"] = master_id_series
+
+    # Report unmatched names
+    unmatched = sorted(set(df.loc[df["master_id"] == 0, name_col].astype(str)))
+    if unmatched:
+        print(f"No master_id match for {len(unmatched)} player(s). Examples: {', '.join(unmatched[:20])}{' ...' if len(unmatched) > 20 else ''}")
+
+    return df
+
+
 def run():
     # 1) NHL 2026 skaters table
     url_skaters_2026 = "https://www.hockey-reference.com/leagues/NHL_2026_skaters.html#player_stats"
@@ -225,6 +377,9 @@ def run():
     skaters_df = fetch_table_by_id(url_skaters_2026, table_id_skaters)
     if skaters_df is not None:
         skaters_df = basic_clean(skaters_df)
+        # Map player names to master_id using local registry
+        registry_path = r"C:\Users\soluk\PycharmProjects\NHLfantasy\hr_players.json"
+        skaters_df = map_master_ids_to_skaters(skaters_df, registry_path, name_column="Player")
         out1 = save_to_csv(skaters_df, "NHL_2026_skaters")
         print(f"Saved 2026 skaters to: {out1}")
     else:
