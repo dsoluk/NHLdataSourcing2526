@@ -56,7 +56,12 @@ def _clean_string_series(s: pd.Series) -> pd.Series:
 
 
 def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Attempt to convert object columns to numeric where appropriate."""
+    """Attempt to convert object columns to numeric where appropriate, preserving integer types.
+
+    - Converts string/object columns to numeric when at least 50% of non-null values are numeric.
+    - If all non-null numeric values are integer-like, cast to pandas nullable integer dtype (Int64).
+    - Otherwise keeps as float.
+    """
     for col in df.columns:
         if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
             cleaned = _clean_string_series(df[col])
@@ -65,10 +70,33 @@ def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
             non_null = cleaned.notna().sum()
             numeric_non_null = coerced.notna().sum()
             if non_null > 0 and numeric_non_null / max(1, non_null) >= 0.5:
-                df[col] = coerced
+                # Determine whether values are effectively integers
+                numeric_vals = coerced.dropna()
+                if not numeric_vals.empty and (numeric_vals - numeric_vals.round()).abs().le(1e-9).all():
+                    # Use nullable integer dtype so missing values are preserved
+                    df[col] = coerced.round().astype("Int64")
+                else:
+                    df[col] = coerced
             else:
                 # Keep cleaned strings for textual columns
                 df[col] = cleaned
+    return df
+
+
+def enforce_integer_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert float columns that are effectively integers to nullable Int64 dtype.
+
+    This ensures values like 0.0, 12.0 are saved as integers while preserving missing values.
+    """
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_float_dtype(s):
+            s_no_na = s.dropna()
+            if s_no_na.empty:
+                continue
+            # If all non-null values are within a tiny tolerance of their rounded integer
+            if (s_no_na - s_no_na.round()).abs().le(1e-9).all():
+                df[col] = s.round().astype("Int64")
     return df
 
 
@@ -92,6 +120,8 @@ def basic_clean(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
     # Coerce numerics where it makes sense
     df = coerce_numeric_columns(df)
+    # After coercion, ensure integer-like numeric columns use nullable Int64 dtype
+    df = enforce_integer_dtypes(df)
     # Reset index after filtering
     df = df.reset_index(drop=True)
     return df
@@ -380,6 +410,20 @@ def run():
         # Map player names to master_id using local registry
         registry_path = r"C:\Users\soluk\PycharmProjects\NHLfantasy\hr_players.json"
         skaters_df = map_master_ids_to_skaters(skaters_df, registry_path, name_column="Player")
+        # Normalize headers for integration: drop the first-level prefix for ALL columns that contain an underscore.
+        # Example: "Skaters_Goals" -> "Goals", "Totals_EV_G" -> "EV_G" (keeps informative lower-level parts).
+        try:
+            col_list = [str(c) for c in skaters_df.columns]
+            # First drop the first-level prefix (text before the first underscore) if present
+            interim_cols = [c.split("_", 1)[1] if "_" in c else c for c in col_list]
+            # Then remove all remaining underscores from every header except 'master_id'
+            new_cols = [col if col == "master_id" else col.replace("_", "") for col in interim_cols]
+            skaters_df.columns = new_cols
+            # De-duplicate after renaming while preserving the first occurrence
+            skaters_df = skaters_df.loc[:, ~pd.Index(skaters_df.columns).duplicated()]
+        except Exception:
+            # Non-fatal: keep original columns if anything goes wrong
+            pass
         out1 = save_to_csv(skaters_df, "NHL_2026_skaters")
         print(f"Saved 2026 skaters to: {out1}")
     else:
